@@ -5,11 +5,17 @@
 # Requires:
 #   Python 2.7
 #   gdata 2.0 python library
-#   sips command-line image processing tools.
+#   PIL or sips command-line image processing tools.
 #
 # Copyright (C) 2011 Jack Palevich, All Rights Reserved
+# Additions performed by CRiSP in 2015
 #
 # Contains code from http://nathanvangheem.com/news/moving-to-picasa-update
+
+#
+# TODO:
+# - implement uploading only metadata (also for existing files), e.g. "--forcemetadata" option 
+#      -> this needs to work on the syncDirs() method which is called for files that exist in both locations
 
 import sys
 if sys.version_info < (2,7):
@@ -19,8 +25,8 @@ if sys.version_info < (2,7):
     sys.exit(1)
 
 import argparse
-import atom
-import atom.service
+#import atom
+#import atom.service
 import filecmp
 import gdata
 import gdata.photos.service
@@ -28,22 +34,77 @@ import gdata.media
 import gdata.geo
 import getpass
 import os
-import pyexiv2
-import subprocess
 import tempfile
 import time
+import subprocess
+import re
+import PIL
 
-from gdata.photos.service import GPHOTOS_INVALID_ARGUMENT, GPHOTOS_INVALID_CONTENT_TYPE, GooglePhotosException
+from gdata.photos.service import atom, GPHOTOS_INVALID_ARGUMENT, GPHOTOS_INVALID_CONTENT_TYPE, GooglePhotosException
 
 PICASA_MAX_FREE_IMAGE_DIMENSION = 2048
 PICASA_MAX_VIDEO_SIZE_BYTES = 104857600
 
+# global variables
+skipdirs = None
+
+
+# Try to import PIL if installed
 try:
     from PIL import Image
     HAS_PIL_IMAGE = True
 except:
     HAS_PIL_IMAGE = False
 
+# Try to import PY_EXIV2 if installed
+try:
+    import pyexiv2
+    HAS_PYEXIV2 = True
+except:
+    HAS_PYEXIV2 = False
+
+
+# Finds an executable on linux or windows PATH with a specific name
+def which(program):
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+    
+    if (sys.platform == 'win32'):
+        prog = program + '.exe'
+    else:
+        prog = program
+    
+    fpath, fname = os.path.split(prog)
+    if fpath:
+        if is_exe(prog):
+            return prog
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, prog)
+            if is_exe(exe_file):
+                return exe_file
+    
+    return None
+
+# Try to find EXIFTOOL if installed
+exifTool = which('exiftool')
+if (exifTool is not None):
+    print '*** exiftool found at: ' + exifTool
+    HAS_EXIF = True
+else:
+    HAS_EXIF = False
+
+# Try to find SIPS if installed
+sipsTool = which('sips')
+if (sipsTool is not None):
+    print '*** sips found at: ' + sipsTool
+    HAS_SIPS = True
+else:
+    HAS_SIPS = False
+    
+    
+    
 class VideoEntry(gdata.photos.PhotoEntry):
     pass
 
@@ -221,9 +282,30 @@ def isMediaFilename(filename):
     return getContentType(filename) != None
 
 def visit(arg, dirname, names):
+    # arg is the "hash" supplied in the "os.path.walk" call
+    # dirname is the directory we are walking into
+    # names is the content of the directory which we are free to modify to prevent it being crawled further
+    
+    # Skip hidden folders
     basedirname = os.path.basename(dirname)
     if basedirname.startswith('.'):
+        # We skip this directory and everything underneath
+        del names[:]
         return
+    
+     # Skip folders defined by user
+    if skipdirs is not None:
+        # Iterate over the list
+        for regex in skipdirs:
+            if re.match(regex, basedirname, re.M|re.I):
+                # We skip this directory and everything underneath
+                del names[:]
+                return
+
+    # Find all mediafiles that are:
+    #  - not hidden files
+    #  - are a known media extension type
+    #  - are actual files (not directories)
     mediaFiles = [name for name in names if not name.startswith('.') and isMediaFilename(name) and
         os.path.isfile(os.path.join(dirname, name))]
     count = len(mediaFiles)
@@ -232,6 +314,7 @@ def visit(arg, dirname, names):
 
 def findMedia(source):
     hash = {}
+    # Run over all files, calling the "visit" function for every file encountered, passing "hash" array as an argument to the visit function
     os.path.walk(source, visit, hash)
     return hash
 
@@ -247,6 +330,7 @@ def findDupDirs(photos):
     # print [len(photos[i]['files']) for i in photos]
 
 def toBaseName(photos):
+    # Create a mapping between a pathname and an album name
     d = {}
     for i in photos:
         base = os.path.basename(i)
@@ -293,14 +377,20 @@ def syncDirs(gd_client, dirs, local, web, no_resize):
 def syncDir(gd_client, dir, localAlbum, webAlbum, no_resize):
     webPhotos = getWebPhotosForAlbum(gd_client, webAlbum)
     webPhotoDict = {}
+    
+    # Filter out duplicates in the web album
     for photo in webPhotos:
         title = photo.title.text
         if title in webPhotoDict:
             print "duplicate web photo: " + webAlbum.title.text + " " + title
         else:
             webPhotoDict[title] = photo
+            
+    # Now that we have unique list of web photos (duplicates filtered), compare
+    # with the files we have locally for that album...
     report = compareLocalToWebDir(localAlbum['files'], webPhotoDict)
     localOnly = report['localOnly']
+    # Upload all files that we have locally only
     for f in localOnly:
         localPath = os.path.join(localAlbum['path'], f)
         upload(gd_client, localPath, webAlbum, f, no_resize)
@@ -327,14 +417,15 @@ def getTempPath(localPath):
     return tempPath
 
 def imageMaxDimension(path):
-    if (HAS_PIL_IMAGE):
+    if HAS_PIL_IMAGE:
         return imageMaxDimensionByPIL(path)
-    output = subprocess.check_output(['sips', '-g', 'pixelWidth', '-g',
-        'pixelHeight', path])
-    lines = output.split('\n')
-    w = int(lines[1].split()[1])
-    h = int(lines[2].split()[1])
-    return max(w,h)
+    elif HAS_SIPS:        
+        output = subprocess.check_output([sipsTool, '-g', 'pixelWidth', '-g', 'pixelHeight', path])
+        lines = output.split('\n')
+        w = int(lines[1].split()[1])
+        h = int(lines[2].split()[1])
+        return max(w,h)
+    return 0
 
 def imageMaxDimensionByPIL(path):
   img = Image.open(path)
@@ -342,19 +433,20 @@ def imageMaxDimensionByPIL(path):
   return max(w,h)
 
 def shrinkIfNeeded(path, maxDimension):
+    # Shrinking is only support if we have PIL or SIPS
     if (HAS_PIL_IMAGE):
         return shrinkIfNeededByPIL(path, maxDimension)
-    if imageMaxDimension(path) > maxDimension:
-        print "Shrinking " + path
-        imagePath = getTempPath(path)
-        subprocess.check_call(['sips', '--resampleHeightWidthMax',
-            str(maxDimension), path, '--out', imagePath])
-        return imagePath
+    if HAS_SIPS:
+        if imageMaxDimension(path) > maxDimension:
+            print "-> shrinking " + path
+            imagePath = getTempPath(path)
+            subprocess.check_call([sipsTool, '--resampleHeightWidthMax', str(maxDimension), path, '--out', imagePath])
+            return imagePath
     return path
 
 def shrinkIfNeededByPIL(path, maxDimension):
     if imageMaxDimensionByPIL(path) > maxDimension:
-        print "Shrinking " + path
+        print "-> shrinking " + path
         imagePath = getTempPath(path)
         img = Image.open(path)
         (w,h) = img.size
@@ -365,23 +457,31 @@ def shrinkIfNeededByPIL(path, maxDimension):
         img2.save(imagePath, 'JPEG', quality=99)
 
         # now copy EXIF data from original to new
-        src_image = pyexiv2.ImageMetadata(path)
-        src_image.read()
-        dst_image = pyexiv2.ImageMetadata(imagePath)
-        dst_image.read()
-        src_image.copy(dst_image, exif=True)
-        # overwrite image size based on new image
-        dst_image["Exif.Photo.PixelXDimension"] = img2.size[0]
-        dst_image["Exif.Photo.PixelYDimension"] = img2.size[1]
-        dst_image.write()
-
+        if HAS_PYEXIV2:
+            # Method 1: use PYEXIV2
+            src_image = pyexiv2.ImageMetadata(path)
+            src_image.read()
+            dst_image = pyexiv2.ImageMetadata(imagePath)
+            dst_image.read()
+            src_image.copy(dst_image, exif=True)
+            # overwrite image size based on new image
+            dst_image["Exif.Photo.PixelXDimension"] = img2.size[0]
+            dst_image["Exif.Photo.PixelYDimension"] = img2.size[1]
+            dst_image.write()
+        elif HAS_EXIF:
+            # Method 2: use EXIFTOOL
+            subprocess.call([exifTool, "-q", "-q", "-tagsfromfile", path, imagePath])
+            
         return imagePath
     return path
 
 def upload(gd_client, localPath, album, fileName, no_resize):
-    print "Uploading " + localPath
+    print "Processing " + localPath
     contentType = getContentType(fileName)
 
+    ##########################################################
+    # Do sanity check: picture to be resized? Video file within limits?
+    ##########################################################
     if contentType.startswith('image/'):
         if no_resize:
             imagePath = localPath
@@ -396,20 +496,64 @@ def upload(gd_client, localPath, album, fileName, no_resize):
         # tested by cpbotha on 2013-05-24
         # this limit still exists
         if size > PICASA_MAX_VIDEO_SIZE_BYTES:
-            print "Video file too big to upload: " + str(size) + " > " + str(PICASA_MAX_VIDEO_SIZE_BYTES)
+            print "-> Video file too big to upload: " + str(size) + " > " + str(PICASA_MAX_VIDEO_SIZE_BYTES)
             return
         imagePath = localPath
         isImage = False
         picasa_photo = VideoEntry()
-    picasa_photo.title = atom.Title(text=fileName)
-    picasa_photo.summary = atom.Summary(text='', summary_type='text')
+        
+    ##########################################################
+    # Set web metadata
+    ##########################################################
+    # Set title = 'filename' in the "photo details" view on Google Plus Albums     
+    picasa_photo.title = atom.Title(text=fileName)      
+      
+    ##########################################################
+    # Read EXIF/IPTC/XMP data
+    ##########################################################
+    print "-> reading metadata from " + imagePath
+
+    p_summary = None
+    
+    # Method 1: use PYEXIV2, preferred method
+    if HAS_PYEXIV2:
+        p_metadata = pyexiv2.ImageMetadata(imagePath)
+        p_metadata.read()
+        # Retrieve DESCRIPTION
+        if 'Exif.Image.ImageDescription' in p_metadata.exif_keys:
+            p_summary = atom.Summary(text=p_metadata['Exif.Image.ImageDescription'].value, summary_type='text')
+    
+    # Method 2: use EXIFTOOL
+    if ((p_summary is None) and HAS_EXIF):
+        # Call ExifTool on the file to read all tags...
+        exifdata = subprocess.check_output([exifTool, imagePath])
+        exifdata = exifdata.splitlines()
+        p_metadata = dict()
+        for i, each in enumerate(exifdata):
+            # tags and values are separated by a colon
+            tag,val = each.split(': ', 1) # '1' only allows one split
+            p_metadata[tag.strip()] = val.strip()
+        
+        # Now we have all tags we need in exif.keys()
+        if 'Image Description' in p_metadata.keys():
+            p_summary = atom.Summary(text=p_metadata['Image Description'], summary_type='text')
+    
+    # Add result to the to-be written picture...   
+    if (p_summary is not None):              
+        picasa_photo.summary = p_summary
+          
+    ##########################################################
+    # Upload picture
+    ##########################################################
+
+    print '-> uploading ' + imagePath
     delay = 1
     while True:
         try:
             if isImage:
-                gd_client.InsertPhoto(album, picasa_photo, imagePath, content_type=contentType)
+                photo = gd_client.InsertPhoto(album, picasa_photo, imagePath, content_type=contentType)
             else:
-                gd_client.InsertVideo(album, picasa_photo, imagePath, content_type=contentType)
+                video = gd_client.InsertVideo(album, picasa_photo, imagePath, content_type=contentType)
             break
         except gdata.photos.service.GooglePhotosException, e:
           print "Got exception " + str(e)
@@ -421,24 +565,44 @@ def upload(gd_client, localPath, album, fileName, no_resize):
     if imagePath != localPath:
         os.remove(imagePath)
 
+    ##########################################################
+    # Post-processing of tags
+    ########################################################## 
+#    if isImage:
+        #if 'Exif.Image.ImageDescription' in p_metadata.exif_keys:
+            
+        # Tags can be set using...
+#        if not photo.media.keywords:
+#            photo.media.keywords = gdata.media.Keywords()
+#        photo.media.keywords.text = 'foo, bar, baz'
+#        photo = gd_client.UpdatePhotoMetadata(photo)
+    
+    
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Upload pictures to picasa web albums / Google+.')
     parser.add_argument('--email', help='the google account email to use (example@gmail.com)', required=True)
-    parser.add_argument('--password', help='the password (you will be promted if this is omitted)', required=False)
+    parser.add_argument('--password', help='the password (you will be prompted if this is omitted)', required=False)
     parser.add_argument('--source', help='the directory to upload', required=True)
     parser.add_argument(
           '--no-resize',
           help="Do not resize images, i.e., upload photos with original size.",
           action='store_true')
+    parser.add_argument('--skipdirs', help='a vertical slash "|" separated list of directory regex patterns to skip', required=False)
 
     args = parser.parse_args()
 
     if args.no_resize:
         print "*** Images will be uploaded at original size."
-
     else:
-        print "*** Images will be resized to 2048 pixels."
-
+        if (HAS_PIL_IMAGE or HAS_SIPS):
+            if HAS_PIL_IMAGE:
+                print "*** Images will be resized to 2048 pixels (PIL)."
+            if HAS_SIPS:
+                print "*** Images will be resized to 2048 pixels (SIPS)."
+        else:
+            print "*** WARNING: resize requested but neither PIL or SIPS has been found! Images will not be resized."
+            
     email = args.email
     password = None
     if 'password' in args and args.password is not None:
@@ -446,10 +610,31 @@ if __name__ == '__main__':
     else:
         password = getpass.getpass("Enter password for " + email + ": ")
 
+    if 'skipdirs' in args and args.skipdirs is not None:
+        # Get a list of all the regex's of directories to skip; we use "|" as separation character
+        skipdirs = args.skipdirs.split("|")
+        for regex in skipdirs:
+           print '*** skipping directories: ' + regex 
+
+    print ''
+    
     gd_client = login(email, password)
     # protectWebAlbums(gd_client)
+    
+    # Retrieve web albums, index local albums 
+    # -> Results of retrieval functions are mappings between picture path & album they correspond to
     webAlbums = getWebAlbums(gd_client)
     localAlbums = toBaseName(findMedia(args.source))
+    
+    # Compare albums found locally with those on the web. This will not compare individual
+    # pictures but just whether the album exists or not
     albumDiff = compareLocalToWeb(localAlbums, webAlbums)
+    
+    # Synchronize files in albums that exist both locally & on the web
     syncDirs(gd_client, albumDiff['both'], localAlbums, webAlbums, args.no_resize)
+    
+    # Upload (entire) albums that exist only locally
     uploadDirs(gd_client, albumDiff['localOnly'], localAlbums, args.no_resize)
+
+    print "*** execution finished."
+    
