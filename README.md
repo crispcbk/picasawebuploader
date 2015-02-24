@@ -2,23 +2,16 @@ picasawebuploader
 =================
 
 A script that uploads photos to Google+ / Picasa Web Albums
+Original written by Jackpal, see: https://github.com/jackpal/picasawebuploader
 
 + Resizes large images to be less than the free limit (2048 x 2048)
 + Uploads all directories under a given directory
-+ restartable
++ Restartable
 + Creates the albums as "private" aka "limited"
 + Automatically retries when Google data service errors out.
-
-Attention: This script is obsolete for Windows and Mac
-------------------------------------------------------
-
-It looks like Google Picasa for Windows and Mac now comes with a back up tool
-that performs the same functionality as this script. If you are using a Windows
-or Macintosh system, you probably should look into using the official Google
-tool instead. See [Picasa](http://picasa.google.com/).
-
-For more details, read this unofficial blog post describing the
-[Google+ Auto Backup for Desktop](http://googlesystem.blogspot.com/2013/12/google-auto-backup-for-desktop.html) tool.
++ Runs under various OS's (tested under Windows & Synology NAS)
++ RegEx based skipping of directories
++ Can be used to copy also metadata from local pictures to Picasa
 
 
 To Do
@@ -29,6 +22,9 @@ To Do
 + Deal with duplicate picture and folder names, both on local and web collections.
   + Currently we just throw an exception when we detect duplicate names.
 + Deal with 'Error: 17 REJECTED_USER_LIMIT' errors.
++ Performance enhancement: check metadata differences before updating
++ Synchronization of people tags from local to Picasa
++ Synchronization of people tags from Picasa to local?
 
 Installation
 ------------
@@ -40,7 +36,7 @@ Installation
   + The PIL library for Python or BSD "sips" image processing program.
 	+ PIL is available on most UNIX like systems.
     + "sips" comes pre-installed on OSX.
-  + pyexiv2 module for writing correct EXIF data
+  + pyexiv2 module for writing correct EXIF data, or 'exiftool'
 
 Known Problems
 --------------
