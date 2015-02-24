@@ -1,9 +1,10 @@
 picasawebuploader
 =================
 
-A script that uploads photos to Google+ / Picasa Web Albums
-Original written by Jackpal, see: https://github.com/jackpal/picasawebuploader
+A script that uploads photos to Google+ / Picasa Web Albums. The original script
+written by Jackpal, see: https://github.com/jackpal/picasawebuploader
 
+Features:
 + Resizes large images to be less than the free limit (2048 x 2048)
 + Uploads all directories under a given directory
 + Restartable
