@@ -11,11 +11,15 @@
 # Additions performed by CRiSP in 2015
 #
 # Contains code from http://nathanvangheem.com/news/moving-to-picasa-update
-
 #
-# TODO:
-# - implement uploading only metadata (also for existing files), e.g. "--forcemetadata" option 
-#      -> this needs to work on the syncDirs() method which is called for files that exist in both locations
+# Notes:
+#  - Pictures under 2048x2048 pixels are free for storage on Picasa Web Albums, and so are videos
+#    under 15 mins are free for storage; see: https://support.google.com/picasa/answer/6558?hl=en
+#  - Maximum picture size is 50 MB, maximum video size is 1 GB; 
+#    see: https://support.google.com/picasa/answer/43879
+#    => However, when trying to upload a video larger than 100 MB, the call gets suspended immediately
+#       with a "broken pipe" error. Therefore, we cap on 100 MB.
+#
 
 import sys
 if sys.version_info < (2,7):
@@ -370,11 +374,11 @@ def compareLocalToWebDir(localAlbum, webPhotoDict):
             webOnly.append(i)
     return {'localOnly' : localOnly, 'both' : both, 'webOnly' : webOnly}
 
-def syncDirs(gd_client, dirs, local, web, no_resize):
+def syncDirs(gd_client, dirs, local, web, no_resize, forcemetadata):
     for dir in dirs:
-        syncDir(gd_client, dir, local[dir], web[dir], no_resize)
+        syncDir(gd_client, dir, local[dir], web[dir], no_resize, forcemetadata)
 
-def syncDir(gd_client, dir, localAlbum, webAlbum, no_resize):
+def syncDir(gd_client, dir, localAlbum, webAlbum, no_resize, forcemetadata):
     webPhotos = getWebPhotosForAlbum(gd_client, webAlbum)
     webPhotoDict = {}
     
@@ -389,11 +393,21 @@ def syncDir(gd_client, dir, localAlbum, webAlbum, no_resize):
     # Now that we have unique list of web photos (duplicates filtered), compare
     # with the files we have locally for that album...
     report = compareLocalToWebDir(localAlbum['files'], webPhotoDict)
-    localOnly = report['localOnly']
+
     # Upload all files that we have locally only
+    localOnly = report['localOnly']
     for f in localOnly:
         localPath = os.path.join(localAlbum['path'], f)
         upload(gd_client, localPath, webAlbum, f, no_resize)
+
+    # Force metadata update for pictures existing on both locations?
+    if forcemetadata:
+        filesBoth = report['both']
+        for file in filesBoth:
+            localPath = os.path.join(localAlbum['path'], file)
+            print 'Metadata update for: ' + file
+            gd_photo = updatemetadata(gd_client, webPhotoDict[file], localPath, file)
+            gd_client.UpdatePhotoMetadata(gd_photo)          
 
 def uploadDirs(gd_client, dirs, local, no_resize):
     for dir in dirs:
@@ -475,38 +489,9 @@ def shrinkIfNeededByPIL(path, maxDimension):
         return imagePath
     return path
 
-def upload(gd_client, localPath, album, fileName, no_resize):
-    print "Processing " + localPath
-    contentType = getContentType(fileName)
-
-    ##########################################################
-    # Do sanity check: picture to be resized? Video file within limits?
-    ##########################################################
-    if contentType.startswith('image/'):
-        if no_resize:
-            imagePath = localPath
-        else:
-            imagePath = shrinkIfNeeded(localPath, PICASA_MAX_FREE_IMAGE_DIMENSION)
-
-        isImage = True
-        picasa_photo = gdata.photos.PhotoEntry()
-    else:
-        size = os.path.getsize(localPath)
-
-        # tested by cpbotha on 2013-05-24
-        # this limit still exists
-        if size > PICASA_MAX_VIDEO_SIZE_BYTES:
-            print "-> Video file too big to upload: " + str(size) + " > " + str(PICASA_MAX_VIDEO_SIZE_BYTES)
-            return
-        imagePath = localPath
-        isImage = False
-        picasa_photo = VideoEntry()
-        
-    ##########################################################
-    # Set web metadata
-    ##########################################################
+def updatemetadata(gd_client, gd_photo, imagePath, fileName):
     # Set title = 'filename' in the "photo details" view on Google Plus Albums     
-    picasa_photo.title = atom.Title(text=fileName)      
+    gd_photo.title = atom.Title(text=fileName)      
       
     ##########################################################
     # Read EXIF/IPTC/XMP data
@@ -540,7 +525,41 @@ def upload(gd_client, localPath, album, fileName, no_resize):
     
     # Add result to the to-be written picture...   
     if (p_summary is not None):              
-        picasa_photo.summary = p_summary
+        gd_photo.summary = p_summary
+    
+    return gd_photo
+
+def upload(gd_client, localPath, album, fileName, no_resize):
+    print "Processing " + localPath
+    contentType = getContentType(fileName)
+
+    ##########################################################
+    # Do sanity check: picture to be resized? Video file within limits?
+    ##########################################################
+    if contentType.startswith('image/'):
+        if no_resize:
+            imagePath = localPath
+        else:
+            imagePath = shrinkIfNeeded(localPath, PICASA_MAX_FREE_IMAGE_DIMENSION)
+
+        isImage = True
+        picasa_photo = gdata.photos.PhotoEntry()
+    else:
+        size = os.path.getsize(localPath)
+
+        # tested by cpbotha on 2013-05-24 / tested by crisp on 2015-02-24
+        # this limit still exists
+        if size > PICASA_MAX_VIDEO_SIZE_BYTES:
+            print "-> Video file too big to upload: " + str(size) + " > " + str(PICASA_MAX_VIDEO_SIZE_BYTES)
+            return
+        imagePath = localPath
+        isImage = False
+        picasa_photo = VideoEntry()
+        
+    ##########################################################
+    # Update metadata
+    ##########################################################
+    picasa_photo = updatemetadata(gd_client, picasa_photo, imagePath, fileName)
           
     ##########################################################
     # Upload picture
@@ -584,11 +603,9 @@ if __name__ == '__main__':
     parser.add_argument('--email', help='the google account email to use (example@gmail.com)', required=True)
     parser.add_argument('--password', help='the password (you will be prompted if this is omitted)', required=False)
     parser.add_argument('--source', help='the directory to upload', required=True)
-    parser.add_argument(
-          '--no-resize',
-          help="Do not resize images, i.e., upload photos with original size.",
-          action='store_true')
+    parser.add_argument('--no-resize', help="Do not resize images, i.e., upload photos with original size.", action='store_true')
     parser.add_argument('--skipdirs', help='a vertical slash "|" separated list of directory regex patterns to skip', required=False)
+    parser.add_argument('--forcemetadata', help='force remote updating of metadata for all pictures', action='store_true')
 
     args = parser.parse_args()
 
@@ -631,7 +648,7 @@ if __name__ == '__main__':
     albumDiff = compareLocalToWeb(localAlbums, webAlbums)
     
     # Synchronize files in albums that exist both locally & on the web
-    syncDirs(gd_client, albumDiff['both'], localAlbums, webAlbums, args.no_resize)
+    syncDirs(gd_client, albumDiff['both'], localAlbums, webAlbums, args.no_resize, args.forcemetadata)
     
     # Upload (entire) albums that exist only locally
     uploadDirs(gd_client, albumDiff['localOnly'], localAlbums, args.no_resize)
